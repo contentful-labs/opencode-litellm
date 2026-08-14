@@ -9,6 +9,7 @@ import {
 import {
   formatModelName,
   categorizeModel,
+  requiresResponsesAPI,
 } from '../utils/format-model-name'
 import type { LiteLLMModel, LiteLLMModelInfo } from '../types'
 
@@ -16,6 +17,23 @@ const CHAT_PROVIDER_ID = 'litellm'
 // Covers the sequential 3 s health check plus the parallel 15 s
 // models/model-info fetch phase, with headroom.
 const DISCOVERY_TIMEOUT_MS = 20000
+
+/**
+ * When LiteLLM reports no reasoning-effort support flags at all (every
+ * `supports_*_reasoning_effort` is null/absent), we can't tell which
+ * levels the upstream accepts. For models that are otherwise
+ * reasoning-capable, assume the full ladder so users can pick any
+ * level from the picker rather than getting no variants at all.
+ * Ordered low→high; `none` is intentionally excluded.
+ */
+const DEFAULT_REASONING_EFFORTS = [
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const
 
 /**
  * OpenCode invokes the `config` hook several times per run with a
@@ -140,12 +158,20 @@ function toConfigModel(
   if (input.length > 1) {
     entry.modalities = { input, output: ['text'] }
   }
-  entry.variants = info?.supports_reasoning_efforts?.length
+  // Surface reasoning-effort variants. Prefer the exact levels LiteLLM
+  // reports; if it reports none but the model is reasoning-capable,
+  // assume the full ladder (see DEFAULT_REASONING_EFFORTS).
+  const reportedEfforts = info?.supports_reasoning_efforts
+  const isReasoningCapable =
+    model.supports_reasoning === true || requiresResponsesAPI(model)
+  const efforts = reportedEfforts?.length
+    ? reportedEfforts
+    : isReasoningCapable
+      ? [...DEFAULT_REASONING_EFFORTS]
+      : undefined
+  entry.variants = efforts?.length
     ? Object.fromEntries(
-        info.supports_reasoning_efforts.map((effort) => [
-          effort,
-          { reasoningEffort: effort },
-        ]),
+        efforts.map((effort) => [effort, { reasoningEffort: effort }]),
       )
     : undefined
   return entry
