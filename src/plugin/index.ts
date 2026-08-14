@@ -132,6 +132,18 @@ function enrichModel(model: LiteLLMModel, info: LiteLLMModelInfo): LiteLLMModel 
     supports_audio_input: model.supports_audio_input ?? info.supports_audio_input,
     input_cost_per_token: model.input_cost_per_token ?? info.input_cost_per_token,
     output_cost_per_token: model.output_cost_per_token ?? info.output_cost_per_token,
+    cache_read_input_token_cost:
+      model.cache_read_input_token_cost ?? info.cache_read_input_token_cost,
+    cache_creation_input_token_cost:
+      model.cache_creation_input_token_cost ?? info.cache_creation_input_token_cost,
+    ...Object.fromEntries(
+      Object.entries(info).filter(
+        ([key, value]) =>
+          value != null &&
+          /^.+_(?:cost_per_token|token_cost)_above_\d+k_tokens$/.test(key) &&
+          (model as Record<string, unknown>)[key] == null,
+      ),
+    ),
   }
 }
 
@@ -142,6 +154,46 @@ function enrichModel(model: LiteLLMModel, info: LiteLLMModelInfo): LiteLLMModel 
  * `x-litellm-response-cost` header, not just the unit names.
  */
 const USD_PER_TOKEN_TO_PER_MILLION = 1_000_000
+
+/**
+ * LiteLLM normally supplies base per-token prices. Bedrock Mantle's
+ * OpenAI models sometimes expose their only usable rate in a context-tier
+ * field. OpenCode cannot represent arbitrary thresholds, so use the first
+ * available tier as a base fallback rather than reporting every request as
+ * free.
+ */
+function pricePerToken(
+  model: LiteLLMModel,
+  field: 'input_cost_per_token' | 'output_cost_per_token' |
+    'cache_read_input_token_cost' | 'cache_creation_input_token_cost',
+): number | undefined {
+  const prices = model as Record<string, unknown>
+  const base = prices[field]
+  if (typeof base === 'number') return base
+
+  const tierPattern = new RegExp(`^${field}_above_(\\d+)k_tokens$`)
+  const tiers = Object.entries(prices)
+    .flatMap(([key, value]) => {
+      const match = key.match(tierPattern)
+      return match && typeof value === 'number'
+        ? [{ threshold: Number(match[1]), price: value }]
+        : []
+    })
+    .sort((a, b) => a.threshold - b.threshold)
+  return tiers[0]?.price
+}
+
+function priceAtContextThreshold(
+  model: LiteLLMModel,
+  field: 'input_cost_per_token' | 'output_cost_per_token' |
+    'cache_read_input_token_cost' | 'cache_creation_input_token_cost',
+  threshold: number,
+): number | undefined {
+  const price = (model as Record<string, unknown>)[
+    `${field}_above_${threshold}k_tokens`
+  ]
+  return typeof price === 'number' ? price : undefined
+}
 
 /**
  * Convert a discovered LiteLLM model into an OpenCode config-level
@@ -180,10 +232,41 @@ function toConfigModel(
   // it (rather than defaulting to 0) lets OpenCode/models.dev fall back
   // to their own default instead of us asserting "this model is free"
   // for something LiteLLM simply has no price anchor for (e.g. rerank).
-  if (model.input_cost_per_token != null || model.output_cost_per_token != null) {
+  const inputCost = pricePerToken(model, 'input_cost_per_token')
+  const outputCost = pricePerToken(model, 'output_cost_per_token')
+  const cacheReadCost = pricePerToken(model, 'cache_read_input_token_cost')
+  const cacheWriteCost = pricePerToken(model, 'cache_creation_input_token_cost')
+  if (inputCost != null || outputCost != null) {
     entry.cost = {
-      input: (model.input_cost_per_token ?? 0) * USD_PER_TOKEN_TO_PER_MILLION,
-      output: (model.output_cost_per_token ?? 0) * USD_PER_TOKEN_TO_PER_MILLION,
+      input: (inputCost ?? 0) * USD_PER_TOKEN_TO_PER_MILLION,
+      output: (outputCost ?? 0) * USD_PER_TOKEN_TO_PER_MILLION,
+      ...(cacheReadCost != null && {
+        cache_read: cacheReadCost * USD_PER_TOKEN_TO_PER_MILLION,
+      }),
+      ...(cacheWriteCost != null && {
+        cache_write: cacheWriteCost * USD_PER_TOKEN_TO_PER_MILLION,
+      }),
+    }
+
+    const contextOver200k = {
+      input: priceAtContextThreshold(model, 'input_cost_per_token', 200),
+      output: priceAtContextThreshold(model, 'output_cost_per_token', 200),
+      cache_read: priceAtContextThreshold(model, 'cache_read_input_token_cost', 200),
+      cache_write: priceAtContextThreshold(model, 'cache_creation_input_token_cost', 200),
+    }
+    if (contextOver200k.input != null || contextOver200k.output != null) {
+      Object.assign(entry.cost as Record<string, unknown>, {
+        context_over_200k: {
+          input: (contextOver200k.input ?? 0) * USD_PER_TOKEN_TO_PER_MILLION,
+          output: (contextOver200k.output ?? 0) * USD_PER_TOKEN_TO_PER_MILLION,
+          ...(contextOver200k.cache_read != null && {
+            cache_read: contextOver200k.cache_read * USD_PER_TOKEN_TO_PER_MILLION,
+          }),
+          ...(contextOver200k.cache_write != null && {
+            cache_write: contextOver200k.cache_write * USD_PER_TOKEN_TO_PER_MILLION,
+          }),
+        },
+      })
     }
   }
   const input: Array<'text' | 'image' | 'pdf' | 'audio'> = ['text']

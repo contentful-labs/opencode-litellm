@@ -40,6 +40,9 @@ export interface LiteLLMModel {
    */
   input_cost_per_token?: number
   output_cost_per_token?: number
+  cache_read_input_token_cost?: number
+  cache_creation_input_token_cost?: number
+  [key: `${string}_${'cost_per_token' | 'token_cost'}_above_${number}k_tokens`]: number | undefined
 }
 
 export interface LiteLLMModelsResponse {
@@ -69,6 +72,9 @@ export interface LiteLLMModelInfo {
   supports_audio_input?: boolean
   input_cost_per_token?: number
   output_cost_per_token?: number
+  cache_read_input_token_cost?: number
+  cache_creation_input_token_cost?: number
+  [key: `${string}_${'cost_per_token' | 'token_cost'}_above_${number}k_tokens`]: number | undefined
 }
 
 /** A single entry returned by LiteLLM's `/v1/model/info` endpoint. */

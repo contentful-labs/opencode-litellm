@@ -75,7 +75,7 @@ opencode
 | 🗄️ **SWR model cache** | Caches discovered models under `~/.cache/opencode-litellm`. Startup serves cached models instantly; a background refresh on new sessions keeps them fresh for the next launch. |
 | 🏷️ **Smart formatting** | Turns `anthropic/claude-3-5-sonnet` into `Claude 3 5 Sonnet` in the picker — handles versions, sizes, quantizations, and brand-cased names like `gpt-4o`. |
 | 🧠 **Modality-aware** | Enriches `/v1/models` entries with `/v1/model/info` (`mode`, token limits, capability flags) and hides embedding / image / audio models from the picker. |
-| 💵 **Real pricing** | Maps `input_cost_per_token` / `output_cost_per_token` from `/v1/model/info` into OpenCode's `cost` field, so the picker and `/cost` show what the proxy actually bills instead of `$0.00`. Models LiteLLM has no price for are left unpriced, not falsely marked free. |
+| 💵 **Real pricing** | Maps LiteLLM's base and context-tier per-token prices, including cache reads and writes, from `/v1/model/info` into OpenCode's `cost` field. Models with only a context-tier price use their first available tier instead of being reported as free. |
 | 🧪 **Reasoning-aware routing** | Auto-routes `gpt-5*` / `o1`/`o3`/`o4*` models through a sibling `litellm-responses` provider that uses `/v1/responses`, so tools + `reasoning_effort` actually work. Override per model via `responsesApiModels` / `chatApiModels`. |
 | 🏢 **Provider extraction** | Pulls `litellm_provider` (or the `provider/model` prefix) into `organizationOwner` so models group correctly in the UI. |
 | 🔐 **Auth-aware** | Honours `LITELLM_API_KEY` / `LITELLM_MASTER_KEY` env vars or `provider.litellm.options.apiKey`. |
