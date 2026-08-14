@@ -1,6 +1,13 @@
 import type { LiteLLMModel, LiteLLMModelInfo, LiteLLMModelInfoResponse, LiteLLMModelsResponse } from '../types'
 
 export const DEFAULT_LITELLM_URL = 'http://localhost:4000'
+/**
+ * Default proxy URL used when the provider does not configure a
+ * `baseURL`. Points at Contentful's shared AI gateway (an
+ * OpenAI-compatible LiteLLM proxy) so the plugin works out of the box
+ * without local auto-detection.
+ */
+export const DEFAULT_BASE_URL = 'https://ai-gateway.contentful.tools'
 const MODELS_ENDPOINT = '/v1/models'
 const MODEL_INFO_ENDPOINT = '/v1/model/info'
 // Health checks fail fast so auto-detection stays snappy; the actual

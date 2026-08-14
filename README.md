@@ -70,8 +70,9 @@ opencode
 
 | | |
 |---|---|
-| 🔍 **Auto-detection** | Probes `localhost:4000`, `:8000`, `:8080` and adopts the first responsive proxy. |
+| 🔍 **Sensible default URL** | With no `baseURL` configured, defaults to Contentful's AI gateway (`https://ai-gateway.contentful.tools`). Point `baseURL` anywhere for other proxies. |
 | 📡 **Dynamic discovery** | Queries `/v1/models` so your OpenCode model picker always reflects your live `model_list`. |
+| 🗄️ **SWR model cache** | Caches discovered models under `~/.cache/opencode-litellm`. Startup serves cached models instantly; a background refresh on new sessions keeps them fresh for the next launch. |
 | 🏷️ **Smart formatting** | Turns `anthropic/claude-3-5-sonnet` into `Claude 3 5 Sonnet` in the picker — handles versions, sizes, quantizations, and brand-cased names like `gpt-4o`. |
 | 🧠 **Modality-aware** | Enriches `/v1/models` entries with `/v1/model/info` (`mode`, token limits, capability flags) and hides embedding / image / audio models from the picker. |
 | 💵 **Real pricing** | Maps `input_cost_per_token` / `output_cost_per_token` from `/v1/model/info` into OpenCode's `cost` field, so the picker and `/cost` show what the proxy actually bills instead of `$0.00`. Models LiteLLM has no price for are left unpriced, not falsely marked free. |
@@ -201,6 +202,13 @@ surfaces those as OpenCode variants under the discovered model. Each variant
 sets `reasoningEffort` to the reported level, so you can switch between
 effort levels from the model picker without hand-curating every entry.
 
+If LiteLLM reports **no** reasoning-effort flags at all (every
+`supports_*_reasoning_effort` is `null`) but the model is otherwise
+reasoning-capable (`supports_reasoning` is true, or it's a gpt-5 / o-series
+model), the plugin assumes the full ladder — `minimal`, `low`, `medium`,
+`high`, `xhigh`, `max` — so you can still pick any effort level from the
+picker. Plain (non-reasoning) models get no effort variants.
+
 To override the routing per model:
 
 ```jsonc
@@ -270,6 +278,29 @@ If your LiteLLM proxy is behind Cloudflare Access or another gateway that requir
 
 These headers are included in every request the plugin makes during model discovery (health check and `/v1/models`). To obtain a Cloudflare Access Service Token, follow the [Cloudflare docs](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/).
 
+## 🗄️ Model caching (stale-while-revalidate)
+
+Model discovery is cached to disk so OpenCode startup isn't blocked on
+the network after the first run:
+
+- **First run (cold cache):** the plugin fetches `/v1/models` +
+  `/v1/model/info` live, injects the models, and writes the result to a
+  cache file. This run is slower — it waits on the proxy.
+- **Subsequent runs (warm cache):** cached models are served
+  synchronously, so startup stays fast.
+- **Background refresh:** whenever a new session is created, the plugin
+  revalidates the cache off the critical path. Because OpenCode reads
+  provider config only at startup, refreshed models surface on the
+  **next** launch — not mid-session.
+
+The cache lives under `~/.cache/opencode-litellm` (honours
+`XDG_CACHE_HOME`), one file per proxy `baseURL`. To force a full
+re-fetch, delete that directory:
+
+```bash
+rm -rf ~/.cache/opencode-litellm
+```
+
 ## 🔧 How it works
 
 ```mermaid
@@ -298,7 +329,7 @@ sequenceDiagram
 ```
 
 1. On OpenCode startup the `config` lifecycle hook fires.
-2. If `provider.litellm` exists, its `baseURL` is used. Otherwise common ports are probed.
+2. If `provider.litellm` exists, its `baseURL` is used. Otherwise the plugin defaults to Contentful's AI gateway (`https://ai-gateway.contentful.tools`).
 3. A health check (`GET /v1/models`) verifies the proxy is reachable and authorized.
 4. Models from the response are enriched with `/v1/model/info` metadata (`mode`, token limits, capability flags, and per-token pricing — `/v1/models` omits these for database-defined models) and converted into OpenCode model entries keyed by `id`, with formatted `name`, `organizationOwner`, inferred `modalities`, and `cost` (USD/1M tokens, converted from LiteLLM's USD/token). Non-chat models (embedding / image / audio) are excluded from the picker.
 5. Each model is bucketed by transport — reasoning-tier models (`gpt-5*`, `o1`/`o3`/`o4*`, or anything with `mode === 'responses'`) go into the `litellm-responses` provider; everything else goes into `litellm`. Per-model overrides via `responsesApiModels` / `chatApiModels` win.
@@ -328,13 +359,13 @@ sequenceDiagram
 <details>
 <summary><b>Why doesn't a model appear in OpenCode after I add it to LiteLLM?</b></summary>
 
-OpenCode reads the plugin output once at startup. After updating `litellm config.yaml`, restart **both** LiteLLM and OpenCode to refresh the model list.
+OpenCode reads the plugin output once at startup, and the plugin serves models from its on-disk cache. After updating `litellm config.yaml`, either open a new session (which triggers a background refresh for the *next* launch) or restart OpenCode. To force an immediate re-fetch, delete the cache with `rm -rf ~/.cache/opencode-litellm` before restarting.
 </details>
 
 <details>
 <summary><b>Can I use this with a remote LiteLLM proxy?</b></summary>
 
-Yes. Set `provider.litellm.options.baseURL` to your remote URL and (optionally) `apiKey`. Auto-detection only probes `localhost`, but explicit configuration works against any URL.
+Yes. Set `provider.litellm.options.baseURL` to your remote URL and (optionally) `apiKey`. With no `baseURL` set, the plugin defaults to Contentful's AI gateway (`https://ai-gateway.contentful.tools`); explicit configuration works against any URL.
 </details>
 
 <details>
@@ -430,6 +461,7 @@ src/
 ├── types/index.ts              # LiteLLM API types
 ├── utils/
 │   ├── litellm-api.ts          # health check, discovery (/v1/models + /v1/model/info), auto-detect
+│   ├── model-cache.ts          # stale-while-revalidate on-disk cache for discovered models
 │   └── format-model-name.ts    # owner extraction, name formatting, categorization
 └── plugin/
     ├── index.ts                # LiteLLMPlugin entry (config hook, enrichment, filtering)
@@ -442,7 +474,7 @@ See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the full contributor workflow.
 ## 🗺️ Roadmap
 
 - [ ] Optional cost/latency overlay using LiteLLM's `/spend` and `/health` endpoints
-- [ ] In-memory cache with TTL to avoid re-querying on rapid restarts
+- [x] ~~In-memory cache with TTL to avoid re-querying on rapid restarts~~ — shipped as an on-disk SWR cache under `~/.cache/opencode-litellm`.
 - [ ] Model categorization based on `litellm.proxy.config.model_list[].model_info`
 - [ ] Tests with [vitest](https://vitest.dev/)
 - [ ] `chat.params` hook for injecting LiteLLM routing tags / fallbacks
