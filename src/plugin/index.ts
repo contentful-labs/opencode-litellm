@@ -280,14 +280,6 @@ async function discoverModels(
     )
   }
 
-  console.log(
-    `[opencode-litellm] Discovered ${discovered.length} models for provider "${providerId}" from ${baseURL} ` +
-      `(${Object.keys(built).length} built` +
-      (skipped > 0 ? `, ${skipped} non-chat hidden` : '') +
-      (wildcards > 0 ? `, ${wildcards} wildcard ignored` : '') +
-      ')',
-  )
-
   return built
 }
 
@@ -333,9 +325,6 @@ async function backgroundRefresh(baseURL: string): Promise<void> {
     ])
     if (built && Object.keys(built).length > 0) {
       writeModelCache(baseURL, built)
-      console.log(
-        `[opencode-litellm] Background-refreshed model cache for ${baseURL} (${Object.keys(built).length} models)`,
-      )
     }
   } catch {
     // Best-effort — a failed refresh just leaves the stale cache in place.
@@ -481,9 +470,6 @@ export const LiteLLMPlugin: Plugin = async (_input: PluginInput) => {
         if (cached && Object.keys(cached).length > 0) {
           mergeModels(models, cached)
           injectedModelIds.set(baseURL, new Set(Object.keys(models)))
-          console.log(
-            `[opencode-litellm] Loaded ${Object.keys(cached).length} models from cache for provider "${providerId}" (${baseURL}); refresh happens in the background on new sessions.`,
-          )
           continue
         }
 
