@@ -12,12 +12,15 @@ import {
   requiresResponsesAPI,
 } from '../utils/format-model-name'
 import type { LiteLLMModel, LiteLLMModelInfo } from '../types'
-import { readModelCache, writeModelCache } from '../utils/model-cache'
+import { readModelCache, writeModelCache, readModelCacheSavedAt } from '../utils/model-cache'
 
 const CHAT_PROVIDER_ID = 'litellm'
 // Covers the sequential 3 s health check plus the parallel 15 s
 // models/model-info fetch phase, with headroom.
 const DISCOVERY_TIMEOUT_MS = 20000
+// Don't revalidate a baseURL's cache more often than this, so a burst
+// of `session.created` events can't generate repeated discovery traffic.
+const REFRESH_MIN_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
 
 /**
  * When LiteLLM reports no reasoning-effort support flags at all (every
@@ -58,6 +61,22 @@ const refreshContexts = new Map<string, RefreshContext>()
 
 /** baseURLs with an in-flight background refresh, to avoid pile-ups. */
 const refreshInFlight = new Set<string>()
+
+/**
+ * Race a promise against a timeout, resolving to `null` if the timeout
+ * wins. Clears the timer either way so a resolved discovery can't keep
+ * a short-lived process alive waiting on a pending `setTimeout`.
+ */
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout>
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
 
 /**
  * Helper to determine if a provider ID or its configured options indicate
@@ -286,20 +305,20 @@ async function discoverModels(
 /**
  * Merge freshly built model entries into a provider's `models` map
  * without clobbering user-curated (or previously injected) entries.
- * Returns the number of newly added ids.
+ * Returns the ids actually added by this call.
  */
 function mergeModels(
   models: Record<string, unknown>,
   built: Record<string, unknown>,
-): number {
-  let added = 0
+): string[] {
+  const added: string[] = []
   for (const [id, entry] of Object.entries(built)) {
-    if (models[id]) continue
+    if (Object.hasOwn(models, id)) continue
     models[id] = entry
-    added++
+    added.push(id)
   }
   // Remove the seed placeholder if real models were merged in.
-  if (models['_'] && Object.keys(models).length > 1) {
+  if (Object.hasOwn(models, '_') && Object.keys(models).length > 1) {
     delete models['_']
   }
   return added
@@ -315,14 +334,18 @@ async function backgroundRefresh(baseURL: string): Promise<void> {
   if (refreshInFlight.has(baseURL)) return
   const ctx = refreshContexts.get(baseURL)
   if (!ctx) return
+  // Skip if the cache was refreshed recently — a burst of new sessions
+  // shouldn't hammer the proxy with health checks and discovery calls.
+  const savedAt = readModelCacheSavedAt(baseURL)
+  if (savedAt !== null && Date.now() - savedAt < REFRESH_MIN_INTERVAL_MS) {
+    return
+  }
   refreshInFlight.add(baseURL)
   try {
-    const built = await Promise.race([
+    const built = await withTimeout(
       discoverModels(baseURL, ctx.apiKey, ctx.customHeaders, ctx.providerId),
-      new Promise<null>((resolve) =>
-        setTimeout(() => resolve(null), DISCOVERY_TIMEOUT_MS),
-      ),
-    ])
+      DISCOVERY_TIMEOUT_MS,
+    )
     if (built && Object.keys(built).length > 0) {
       writeModelCache(baseURL, built)
     }
@@ -458,7 +481,7 @@ export const LiteLLMPlugin: Plugin = async (_input: PluginInput) => {
         const alreadyInjected = injectedModelIds.get(baseURL)
         if (
           alreadyInjected &&
-          [...alreadyInjected].every((id) => models[id])
+          [...alreadyInjected].every((id) => Object.hasOwn(models, id))
         ) {
           continue
         }
@@ -468,23 +491,21 @@ export const LiteLLMPlugin: Plugin = async (_input: PluginInput) => {
         // `event` hook) keeps the cache fresh for the next launch.
         const cached = readModelCache(baseURL)
         if (cached && Object.keys(cached).length > 0) {
-          mergeModels(models, cached)
-          injectedModelIds.set(baseURL, new Set(Object.keys(models)))
+          const added = mergeModels(models, cached)
+          injectedModelIds.set(baseURL, new Set(added))
           continue
         }
 
         // Cold cache: do a live fetch (slow first run only), inject, and
         // persist for subsequent startups. Capped by a timeout so a slow
         // proxy never blocks boot.
-        const built = await Promise.race([
+        const built = await withTimeout(
           discoverModels(baseURL, apiKey, customHeaders, providerId),
-          new Promise<null>((resolve) =>
-            setTimeout(() => resolve(null), DISCOVERY_TIMEOUT_MS),
-          ),
-        ])
+          DISCOVERY_TIMEOUT_MS,
+        )
         if (built && Object.keys(built).length > 0) {
-          mergeModels(models, built)
-          injectedModelIds.set(baseURL, new Set(Object.keys(models)))
+          const added = mergeModels(models, built)
+          injectedModelIds.set(baseURL, new Set(added))
           writeModelCache(baseURL, built)
         }
       }
