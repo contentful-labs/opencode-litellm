@@ -1,3 +1,11 @@
+## [Unreleased]
+
+### Features
+
+* **plugin:** default `baseURL` to Contentful's AI gateway (`https://ai-gateway.contentful.tools`) when no `baseURL` is configured, instead of probing localhost ports.
+* **plugin:** assume the full reasoning-effort ladder (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`) for reasoning-capable models when LiteLLM reports no `supports_*_reasoning_effort` flags.
+* **plugin:** stale-while-revalidate file cache for model discovery under `~/.cache/opencode-litellm`. Startup serves cached models synchronously; a background refresh on new sessions keeps the cache fresh for the next launch.
+
 # [0.8.0](https://github.com/yuseferi/opencode-litellm/compare/v0.7.1...v0.8.0) (2026-08-04)
 
 
