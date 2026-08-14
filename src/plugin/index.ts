@@ -1,6 +1,6 @@
 import type { Plugin, PluginInput } from '@opencode-ai/plugin'
 import {
-  autoDetectLiteLLM,
+  DEFAULT_BASE_URL,
   checkLiteLLMHealth,
   discoverLiteLLMModelInfo,
   discoverLiteLLMModels,
@@ -225,17 +225,19 @@ export const LiteLLMPlugin: Plugin = async (_input: PluginInput) => {
         const apiKey = configuredKey ?? envKey
         const customHeaders = readCustomHeaders(options)
 
-        // Resolve base URL
+        // Resolve base URL. When the provider doesn't configure one,
+        // default to Contentful's AI gateway instead of probing
+        // localhost — the gateway is the expected upstream here.
         let baseURL: string | null = null
         if (configuredBase) {
           baseURL = normalizeBaseURL(configuredBase)
         } else {
-          baseURL = await autoDetectLiteLLM(apiKey, customHeaders)
+          baseURL = normalizeBaseURL(DEFAULT_BASE_URL)
         }
 
         if (!baseURL) {
           console.warn(
-            `[opencode-litellm] No LiteLLM proxy found for provider "${providerId}". Configure options.baseURL or start LiteLLM on port 4000/8000/8080.`,
+            `[opencode-litellm] No LiteLLM proxy URL resolved for provider "${providerId}". Configure options.baseURL.`,
           )
           continue
         }
