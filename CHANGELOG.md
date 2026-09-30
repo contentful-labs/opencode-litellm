@@ -1,14 +1,182 @@
-## [Unreleased]
+## [Unreleased] — Contentful fork
 
-### Features
+### Breaking changes
 
-* **plugin:** default `baseURL` to Contentful's AI gateway (`https://ai-gateway.contentful.tools`) when no `baseURL` is configured, instead of probing localhost ports.
-* **plugin:** assume the full reasoning-effort ladder (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`) for reasoning-capable models when LiteLLM reports no `supports_*_reasoning_effort` flags.
-* **plugin:** stale-while-revalidate file cache for model discovery under `~/.cache/opencode-litellm`. Startup serves cached models synchronously; a background refresh on new sessions keeps the cache fresh for the next launch.
+- Remove the hard-coded Contentful gateway. Set the provider base URL or
+  `LITELLM_BASE_URL` before upgrading; see [FORK.md](./FORK.md).
+- Adopt upstream's object entrypoint (OpenCode V1 1.18.29+ / V2 2.0.14+) and
+  removal of unused public transport types. V1 and V2 use different config shapes.
+
+### Features and fixes
+
+- Merge upstream through `782d349` (1.4.1 plus documentation/CI updates), including
+  native V2 provider discovery, late registration, live refresh and credential switching.
+- Retain the fork's full reasoning-effort fallback and tiered pricing; carry the
+  >200k tier into V2's native cost array instead of dropping it.
+- Refresh metadata for existing plugin-owned V2 model IDs while preserving curated models.
+- Add a root `server.ts` entrypoint for V2 local-directory installations.
+- Keep successful console operations quiet and retain the Contentful Renovate preset.
+- Adopt upstream's integrated SWR cache improvements. Bump cache format to 4 to
+  invalidate old fork/upstream entries missing combined pricing, variants or modalities.
+- Add dual-entrypoint HTTP discovery regression coverage and a fork migration guide.
+
+## [1.4.1](https://github.com/yuseferi/opencode-litellm/compare/v1.4.0...v1.4.1) (2026-09-29)
+
 
 ### Bug Fixes
 
-* **plugin:** map threshold-only LiteLLM pricing (as returned for Bedrock Mantle OpenAI models) into OpenCode's cost fields instead of reporting every request as free.
+* discover LiteLLM providers registered after plugin setup ([#35](https://github.com/yuseferi/opencode-litellm/issues/35)) ([555e302](https://github.com/yuseferi/opencode-litellm/commit/555e302d9dbbdc980d32736368b65237f74ffb5d)), closes [#1](https://github.com/yuseferi/opencode-litellm/issues/1) [#2](https://github.com/yuseferi/opencode-litellm/issues/2)
+
+# [1.4.0](https://github.com/yuseferi/opencode-litellm/compare/v1.3.0...v1.4.0) (2026-09-29)
+
+
+### Features
+
+* OpenCode 2 plugin API support ([#32](https://github.com/yuseferi/opencode-litellm/issues/32)) ([6215ca7](https://github.com/yuseferi/opencode-litellm/commit/6215ca7bb6652916cbece81953d500ee2bbf7e43))
+
+# [1.3.0](https://github.com/yuseferi/opencode-litellm/compare/v1.2.0...v1.3.0) (2026-09-23)
+
+
+### Features
+
+* add `formatModelNames` option to keep raw model ids in the picker ([#30](https://github.com/yuseferi/opencode-litellm/issues/30)) ([303e035](https://github.com/yuseferi/opencode-litellm/commit/303e035fa0e37489b9ee92d9e29ab4b45066b11a))
+
+# [1.2.0](https://github.com/yuseferi/opencode-litellm/compare/v1.1.0...v1.2.0) (2026-09-13)
+
+
+### Features
+
+* per-model capability flag overrides (`modelCapabilities`) ([#28](https://github.com/yuseferi/opencode-litellm/issues/28)) ([e14a09e](https://github.com/yuseferi/opencode-litellm/commit/e14a09e2f1fb4e5ed45ae1c3bf991dc425107e8f))
+
+# [1.1.0](https://github.com/yuseferi/opencode-litellm/compare/v1.0.1...v1.1.0) (2026-09-11)
+
+
+### Features
+
+* filter discovered models via includeModels/excludeModels ([#27](https://github.com/yuseferi/opencode-litellm/issues/27)) ([42c7ea7](https://github.com/yuseferi/opencode-litellm/commit/42c7ea71e33e44176d5b5b7e875a99180e646ac9)), closes [#21](https://github.com/yuseferi/opencode-litellm/issues/21)
+
+## [1.0.1](https://github.com/yuseferi/opencode-litellm/compare/v1.0.0...v1.0.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* TUI-safe logging via OpenCode's log API + configurable request timeout ([#26](https://github.com/yuseferi/opencode-litellm/issues/26)) ([e294071](https://github.com/yuseferi/opencode-litellm/commit/e294071fae0f4fc604be1ac76db205aab1ae96de)), closes [#15](https://github.com/yuseferi/opencode-litellm/issues/15) [#20](https://github.com/yuseferi/opencode-litellm/issues/20) [#24](https://github.com/yuseferi/opencode-litellm/issues/24)
+
+# [1.0.0](https://github.com/yuseferi/opencode-litellm/compare/v0.11.1...v1.0.0) (2026-08-31)
+
+
+### Bug Fixes
+
+* discovery improvements, dead-code removal, tests, and docs alignment ([#24](https://github.com/yuseferi/opencode-litellm/issues/24)) ([3041692](https://github.com/yuseferi/opencode-litellm/commit/30416924b040cb246f28dad1e05d8ae7bb9cd961))
+
+
+### BREAKING CHANGES
+
+* remove previously exported but dead public types
+(`Transport`, `TransportPolicy`, `LiteLLMOptions`, `ModelType`). No
+behavior change — the config-hook plugin is untouched.
+
+* test: add vitest suite and run it in CI
+
+Cover the pure logic that regresses silently: model-name formatting
+(including version-pair/date-stamp edge cases), model categorization,
+base-URL normalization, and the SWR disk cache (round-trip, per-key
+isolation, version mismatch, max-age expiry). Tests live in `test/`
+so they stay out of the published tarball. CI now runs `npm test`
+alongside typecheck on Node 20/22.
+
+* docs: align README and CONTRIBUTING with current behavior
+
+The README still documented the dual-provider architecture removed in
+0.5.0: the `litellm-responses` sibling provider, `transport` /
+`responsesApiModels` / `chatApiModels` options, transport bucketing in
+the How-it-works diagram, and `organizationOwner` extraction — none of
+which the config-hook plugin does. The FAQ even pointed users at
+`responsesApiModels` to fix a reasoning_effort error, which silently
+did nothing.
+
+Rewrite those sections around the actual single-provider + SWR-cache
+flow, fix the naming example ("Claude 3.5 Sonnet"), document the cache
+and background refresh, trim shipped items from the roadmap, update the
+source tree, drop the redundant quickstart install step, and fix the
+plugin log path in CONTRIBUTING.
+
+* fix: use OpenCode's snake_case cache cost field names
+
+The config schema at opencode.ai/config.json defines the model cost
+object as { input, output, cache_read, cache_write }; the camelCase
+cacheRead/cacheWrite keys emitted previously would be silently ignored.
+
+* docs: correct offline-proxy FAQ about warm-cache behavior
+
+A warm on-disk cache is served without any network call, so discovered
+models keep working when the proxy is down; the old answer described
+pre-cache behavior.
+
+* test: restore original XDG_CACHE_HOME after cache tests
+
+* docs: add architecture banner to README
+
+Hand-crafted SVG showing the config-hook flow: OpenCode -> plugin
+(discover/merge/cache) -> LiteLLM proxy -> upstream providers, plus the
+SWR disk cache. Dark, crisp at any size, and no diagram tooling to
+maintain.
+
+* fix: scope in-memory discovery state by provider cache key
+
+Key refreshContexts, refreshInFlight, and injectedModelIds by
+`providerId@baseURL` instead of the bare baseURL, so two providers
+pointing at the same proxy (with different keys) can no longer
+suppress each other's model injection or reuse the wrong refresh
+context.
+
+* fix: refuse version-pair merges inside numeric runs
+
+`model-1-2-3` previously rendered as "Model 1 2.3" because only the
+token after the pair was checked. Also refuse the merge when the
+token immediately before it is a short number, keeping numeric runs
+like `1-2-3` unmerged.
+
+* docs: correct health-check placement in sequence diagram
+
+With a configured baseURL the proxy is not contacted during startup
+unless the cache is cold — the only 3 s fail-fast health check is the
+port probe during auto-detection. Move the contact point below the
+cache read so the diagram matches the SWR fast path.
+
+## [0.11.1](https://github.com/yuseferi/opencode-litellm/compare/v0.11.0...v0.11.1) (2026-08-29)
+
+
+### Bug Fixes
+
+* keep wildcard model aliases in discovery ([#23](https://github.com/yuseferi/opencode-litellm/issues/23)) ([2915da3](https://github.com/yuseferi/opencode-litellm/commit/2915da371633ffa1b22c44e051e20fbfc9a32c7b))
+
+## [Unreleased]
+
+### Bug Fixes
+
+* keep trailing-wildcard model aliases (`claude-sonnet-4-6*`) in discovery; only `provider/*` wildcards are filtered out
+
+# [0.11.0](https://github.com/yuseferi/opencode-litellm/compare/v0.10.0...v0.11.0) (2026-08-29)
+
+
+### Features
+
+* **plugin:** fall back to OpenCode-stored /connect credentials for plugin auth ([#17](https://github.com/yuseferi/opencode-litellm/issues/17)) ([43f4c9d](https://github.com/yuseferi/opencode-litellm/commit/43f4c9d6907a3e4e2de9b816d4af5b2cb3a4bcc9))
+
+
+# [0.10.0](https://github.com/yuseferi/opencode-litellm/compare/v0.9.0...v0.10.0) (2026-08-26)
+
+
+
+* stale-while-revalidate file cache for model discovery ([#19](https://github.com/yuseferi/opencode-litellm/issues/19)) ([f0e41ae](https://github.com/yuseferi/opencode-litellm/commit/f0e41ae24e3a37b0f175b208a4c68a8939d99b4e))
+
+# [0.9.0](https://github.com/yuseferi/opencode-litellm/compare/v0.8.0...v0.9.0) (2026-08-26)
+
+
+### Features
+
+* map LiteLLM model prices into OpenCode cost field ([#22](https://github.com/yuseferi/opencode-litellm/issues/22)) ([cb9254d](https://github.com/yuseferi/opencode-litellm/commit/cb9254d453d0c6b3cf80118c6916103d4c6b9128))
 
 # [0.8.0](https://github.com/yuseferi/opencode-litellm/compare/v0.7.1...v0.8.0) (2026-08-04)
 
@@ -57,6 +225,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **plugin:** surface reasoning-effort variants from `/v1/model/info` reported by LiteLLM
 
 ### Fixed
+- **LiteLLM model discovery now works when the proxy credential was only
+  ever stored via OpenCode's `/connect` command.** The plugin's health
+  check and `/v1/models` / `/v1/model/info` discovery fetches only ever
+  read `options.apiKey` or the `LITELLM_API_KEY` / `LITELLM_MASTER_KEY`
+  env vars. Credentials added through `/connect` (stored in
+  `~/.local/share/opencode/auth.json`) were invisible to them, and for
+  this custom provider OpenCode does not inject stored credentials
+  automatically, so a key-only proxy would fail the health check with
+  an unauthenticated 401, skip discovery entirely, and send chat
+  completions without an `Authorization` header. The plugin now falls
+  back to reading that stored credential and writes the resolved key
+  back into the provider `options`, enabling both authenticated
+  discovery and authenticated completions (precedence: configured
+  `apiKey` > env var > OpenCode-stored credential).
 - **Discovered models now carry real pricing instead of always showing
   `$0.00`.** `toConfigModel()` never read `input_cost_per_token` /
   `output_cost_per_token` from `/v1/model/info`, so every model —

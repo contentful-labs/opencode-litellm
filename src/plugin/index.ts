@@ -1,65 +1,110 @@
 import type { Plugin, PluginInput } from '@opencode-ai/plugin'
 import {
-  DEFAULT_BASE_URL,
+  autoDetectLiteLLM,
   checkLiteLLMHealth,
   discoverLiteLLMModelInfo,
   discoverLiteLLMModels,
+  getRequestTimeoutMs,
   normalizeBaseURL,
 } from '../utils/litellm-api'
 import {
   formatModelName,
   categorizeModel,
-  requiresResponsesAPI,
 } from '../utils/format-model-name'
 import type { LiteLLMModel, LiteLLMModelInfo } from '../types'
-import { readModelCache, writeModelCache, readModelCacheSavedAt } from '../utils/model-cache'
+import { getOpenCodeStoredApiKey } from '../utils/opencode-auth'
+import {
+  buildCacheKey,
+  readModelCache,
+  writeModelCache,
+  readModelCacheSavedAt,
+} from '../utils/model-cache'
+import { passesModelFilter } from '../utils/model-filter'
+import type { ModelFilters } from '../utils/model-filter'
+import { applyCapabilityOverrides, parseModelCapabilities } from '../utils/model-capabilities'
+import type { ModelCapabilities } from '../utils/model-capabilities'
+import { modelCost } from './pricing'
 
 const CHAT_PROVIDER_ID = 'litellm'
-// Covers the sequential 3 s health check plus the parallel 15 s
-// models/model-info fetch phase, with headroom.
-const DISCOVERY_TIMEOUT_MS = 20000
+// Covers the 3 s health check plus the parallel models/model-info fetch
+// phase, with headroom. Scales with LITELLM_REQUEST_TIMEOUT_MS so slow
+// proxies aren't cut off by the overall cap either (issue #20).
+export const DISCOVERY_TIMEOUT_MS = Math.max(20000, getRequestTimeoutMs() + 5000)
 // Don't revalidate a baseURL's cache more often than this, so a burst
 // of `session.created` events can't generate repeated discovery traffic.
 const REFRESH_MIN_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
 
+const DEFAULT_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+
+function isReasoningModel(model: LiteLLMModel): boolean {
+  const id = model.id.split('/').pop()?.toLowerCase() ?? ''
+  return model.supports_reasoning === true || model.mode === 'responses' ||
+    /^gpt-?5(?:[-.].*)?$/.test(id) || /^o[134](?:[-.].*)?$/.test(id)
+}
+
+type LogLevel = 'info' | 'warn' | 'error' | 'debug'
+
+type LogDetails = {
+  service: string
+  level: LogLevel
+  message: string
+}
+
+let logWriter: ((details: LogDetails) => void) | null = null
+
+function initLogging(client: PluginInput['client']): void {
+  logWriter = (details) => {
+    void client.app.log({ body: details }).catch(() => {})
+  }
+}
+
+/** OpenCode 2 does not expose a server log method through its plugin context. */
+export function initV2Logging(): void {
+  logWriter = null
+}
+
 /**
- * When LiteLLM reports no reasoning-effort support flags at all (every
- * `supports_*_reasoning_effort` is null/absent), we can't tell which
- * levels the upstream accepts. For models that are otherwise
- * reasoning-capable, assume the full ladder so users can pick any
- * level from the picker rather than getting no variants at all.
- * Ordered low→high; `none` is intentionally excluded.
+ * Route plugin logs through OpenCode's log API instead of stdout.
+ * console.* writes straight into the same terminal the OpenCode TUI
+ * renders in, corrupting the interface on every background refresh
+ * (issue #15); client.app.log lands in OpenCode's log files instead.
  */
-const DEFAULT_REASONING_EFFORTS = [
-  'minimal',
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-  'max',
-] as const
+function log(level: LogLevel, message: string): void {
+  if (logWriter) {
+    logWriter({ service: 'opencode-litellm', level, message })
+    return
+  }
+  // Keep successful operations quiet when no server log API is available.
+  if (level === 'warn' || level === 'error') console.warn(message)
+}
 
 /**
  * OpenCode invokes the `config` hook several times per run with a
  * cumulative config object. Track which model ids we already injected
- * per baseURL so repeat invocations can return early instead of
- * re-querying the proxy.
+ * per provider (keyed by `providerId@baseURL`) so repeat invocations
+ * can return early instead of re-querying the proxy.
  */
 const injectedModelIds = new Map<string, Set<string>>()
 
 /**
- * Per-baseURL fetch context captured during the `config` hook, so the
+ * Per-provider fetch context captured during the `config` hook, so the
  * `event` hook can revalidate the cache in the background (SWR) without
- * re-deriving auth/headers.
+ * re-deriving auth/headers. Keyed by `providerId@baseURL` — the same
+ * key as the on-disk cache — so providers sharing a proxy keep
+ * independent refresh contexts.
  */
 interface RefreshContext {
+  baseURL: string
   apiKey?: string
   customHeaders?: Record<string, string>
+  filters: ModelFilters
+  capabilities: ModelCapabilities
+  formatModelNames: boolean
   providerId: string
 }
 const refreshContexts = new Map<string, RefreshContext>()
 
-/** baseURLs with an in-flight background refresh, to avoid pile-ups. */
+/** Cache keys with an in-flight background refresh, to avoid pile-ups. */
 const refreshInFlight = new Set<string>()
 
 /**
@@ -67,7 +112,7 @@ const refreshInFlight = new Set<string>()
  * wins. Clears the timer either way so a resolved discovery can't keep
  * a short-lived process alive waiting on a pending `setTimeout`.
  */
-function withTimeout<T>(
+export function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
 ): Promise<T | null> {
@@ -82,7 +127,7 @@ function withTimeout<T>(
  * Helper to determine if a provider ID or its configured options indicate
  * compatibility with LiteLLM.
  */
-function isLiteLLMProvider(
+export function isLiteLLMProvider(
   providerId: string,
   options: Record<string, unknown>,
 ): boolean {
@@ -98,7 +143,7 @@ function isLiteLLMProvider(
 /**
  * Read `customHeaders` from a provider options block.
  */
-function readCustomHeaders(
+export function readCustomHeaders(
   options: Record<string, unknown>,
 ): Record<string, string> | undefined {
   const raw = options.customHeaders
@@ -113,86 +158,68 @@ function readCustomHeaders(
 }
 
 /**
- * Overlay metadata from `/v1/model/info` onto a `/v1/models` entry.
- * Fields already present on the lean entry win; the info block only
- * fills gaps (notably `mode`, which `/v1/models` omits for
- * database-defined models).
+ * Read the `includeModels`/`excludeModels` glob filters from a provider
+ * options block (issue #21's feature: split one proxy's catalog across
+ * several OpenCode providers). Non-string entries are dropped; an empty
+ * result means "don't filter".
  */
-function enrichModel(model: LiteLLMModel, info: LiteLLMModelInfo): LiteLLMModel {
+export function readModelFilters(options: Record<string, unknown>): ModelFilters {
+  const readPatterns = (raw: unknown): string[] | undefined => {
+    if (!Array.isArray(raw)) return undefined
+    const out = raw.filter((v): v is string => typeof v === 'string')
+    return out.length > 0 ? out : undefined
+  }
   return {
-    ...model,
-    mode: model.mode ?? info.mode,
-    max_tokens: model.max_tokens ?? info.max_tokens,
-    max_input_tokens: model.max_input_tokens ?? info.max_input_tokens,
-    max_output_tokens: model.max_output_tokens ?? info.max_output_tokens,
-    supports_function_calling: model.supports_function_calling ?? info.supports_function_calling,
-    supports_vision: model.supports_vision ?? info.supports_vision,
-    supports_reasoning: model.supports_reasoning ?? info.supports_reasoning,
-    supports_pdf_input: model.supports_pdf_input ?? info.supports_pdf_input,
-    supports_audio_input: model.supports_audio_input ?? info.supports_audio_input,
-    input_cost_per_token: model.input_cost_per_token ?? info.input_cost_per_token,
-    output_cost_per_token: model.output_cost_per_token ?? info.output_cost_per_token,
-    cache_read_input_token_cost:
-      model.cache_read_input_token_cost ?? info.cache_read_input_token_cost,
-    cache_creation_input_token_cost:
-      model.cache_creation_input_token_cost ?? info.cache_creation_input_token_cost,
-    ...Object.fromEntries(
-      Object.entries(info).filter(
-        ([key, value]) =>
-          value != null &&
-          /^.+_(?:cost_per_token|token_cost)_above_\d+k_tokens$/.test(key) &&
-          (model as Record<string, unknown>)[key] == null,
-      ),
-    ),
+    includeModels: readPatterns(options.includeModels),
+    excludeModels: readPatterns(options.excludeModels),
   }
 }
 
-/**
- * OpenCode's `cost` config field is USD per **million** tokens (the
- * models.dev convention); LiteLLM's `/v1/model/info` reports USD per
- * single token. `1e6` bridges the two — verified against a live
- * `x-litellm-response-cost` header, not just the unit names.
- */
-const USD_PER_TOKEN_TO_PER_MILLION = 1_000_000
-
-/**
- * LiteLLM normally supplies base per-token prices. Bedrock Mantle's
- * OpenAI models sometimes expose their only usable rate in a context-tier
- * field. OpenCode cannot represent arbitrary thresholds, so use the first
- * available tier as a base fallback rather than reporting every request as
- * free.
- */
-function pricePerToken(
-  model: LiteLLMModel,
-  field: 'input_cost_per_token' | 'output_cost_per_token' |
-    'cache_read_input_token_cost' | 'cache_creation_input_token_cost',
-): number | undefined {
-  const prices = model as Record<string, unknown>
-  const base = prices[field]
-  if (typeof base === 'number') return base
-
-  const tierPattern = new RegExp(`^${field}_above_(\\d+)k_tokens$`)
-  const tiers = Object.entries(prices)
-    .flatMap(([key, value]) => {
-      const match = key.match(tierPattern)
-      return match && typeof value === 'number'
-        ? [{ threshold: Number(match[1]), price: value }]
-        : []
-    })
-    .sort((a, b) => a.threshold - b.threshold)
-  return tiers[0]?.price
+export function readFormatModelNames(options: Record<string, unknown>): boolean {
+  return options.formatModelNames !== false
 }
 
-function priceAtContextThreshold(
+/**
+ * Overlay metadata onto a `/v1/models` entry in three tiers: the entry's
+ * own fields win, `/v1/model/info` fills gaps (notably `mode`, which
+ * `/v1/models` omits for database-defined models), and finally
+ * user-configured `modelCapabilities` overrides apply — explicit
+ * `false` included — because the user knows their deployment better
+ * than either endpoint (issue #25).
+ */
+function enrichModel(
   model: LiteLLMModel,
-  field: 'input_cost_per_token' | 'output_cost_per_token' |
-    'cache_read_input_token_cost' | 'cache_creation_input_token_cost',
-  threshold: number,
-): number | undefined {
-  const price = (model as Record<string, unknown>)[
-    `${field}_above_${threshold}k_tokens`
-  ]
-  return typeof price === 'number' ? price : undefined
+  info: LiteLLMModelInfo | undefined,
+  overrides?: Record<string, boolean>,
+): LiteLLMModel {
+  return applyCapabilityOverrides(
+    {
+      ...model,
+      mode: model.mode ?? info?.mode,
+      max_tokens: model.max_tokens ?? info?.max_tokens,
+      max_input_tokens: model.max_input_tokens ?? info?.max_input_tokens,
+      max_output_tokens: model.max_output_tokens ?? info?.max_output_tokens,
+      supports_function_calling:
+        model.supports_function_calling ?? info?.supports_function_calling,
+      supports_vision: model.supports_vision ?? info?.supports_vision,
+      supports_reasoning: model.supports_reasoning ?? info?.supports_reasoning,
+      supports_pdf_input: model.supports_pdf_input ?? info?.supports_pdf_input,
+      supports_audio_input: model.supports_audio_input ?? info?.supports_audio_input,
+      input_cost_per_token: model.input_cost_per_token ?? info?.input_cost_per_token,
+      output_cost_per_token: model.output_cost_per_token ?? info?.output_cost_per_token,
+      cache_read_input_token_cost:
+        model.cache_read_input_token_cost ?? info?.cache_read_input_token_cost,
+      cache_creation_input_token_cost:
+        model.cache_creation_input_token_cost ?? info?.cache_creation_input_token_cost,
+      ...Object.fromEntries(
+        Object.entries(info ?? {}).filter(
+          ([key, value]) => /^.+_(?:cost_per_token|token_cost)_above_\d+k_tokens$/.test(key) &&
+            value != null && (model as unknown as Record<string, unknown>)[key] == null,
+        ),
+      ),
+    },
+    overrides,
+  )
 }
 
 /**
@@ -201,26 +228,33 @@ function priceAtContextThreshold(
  * `opencode.json`). Returns `null` for non-chat models (embedding,
  * image, audio) — they can't be used as primary chat models and would
  * clutter the picker.
+ *
+ * Exported for tests: `formatModelNames` decides whether the display
+ * name is the prettified id or the raw `/v1/models` id verbatim.
  */
-function toConfigModel(
+export function toConfigModel(
   model: LiteLLMModel,
   info?: LiteLLMModelInfo,
+  formatModelNames = true,
 ): Record<string, unknown> | null {
   const type = categorizeModel(model)
   if (type === 'embedding' || type === 'image' || type === 'audio') {
     return null
   }
   const entry: Record<string, unknown> = {
-    name: formatModelName(model),
+    name: formatModelNames ? formatModelName(model) : model.id,
   }
-  if (model.max_input_tokens || model.max_output_tokens) {
+  // Some deployments only report the OpenAI-style `max_tokens` total;
+  // use it as the context limit when `max_input_tokens` is absent.
+  const contextLimit = model.max_input_tokens ?? model.max_tokens
+  if (contextLimit || model.max_output_tokens) {
     entry.limit = {
-      context: model.max_input_tokens ?? 0,
+      context: contextLimit ?? 0,
       output: model.max_output_tokens ?? 0,
     }
   }
-  if (model.supports_function_calling) {
-    entry.tool_call = true
+  if (model.supports_function_calling != null) {
+    entry.tool_call = model.supports_function_calling
   }
   if (model.supports_reasoning) {
     entry.reasoning = true
@@ -232,64 +266,29 @@ function toConfigModel(
   // it (rather than defaulting to 0) lets OpenCode/models.dev fall back
   // to their own default instead of us asserting "this model is free"
   // for something LiteLLM simply has no price anchor for (e.g. rerank).
-  const inputCost = pricePerToken(model, 'input_cost_per_token')
-  const outputCost = pricePerToken(model, 'output_cost_per_token')
-  const cacheReadCost = pricePerToken(model, 'cache_read_input_token_cost')
-  const cacheWriteCost = pricePerToken(model, 'cache_creation_input_token_cost')
-  if (inputCost != null || outputCost != null) {
-    entry.cost = {
-      input: (inputCost ?? 0) * USD_PER_TOKEN_TO_PER_MILLION,
-      output: (outputCost ?? 0) * USD_PER_TOKEN_TO_PER_MILLION,
-      ...(cacheReadCost != null && {
-        cache_read: cacheReadCost * USD_PER_TOKEN_TO_PER_MILLION,
-      }),
-      ...(cacheWriteCost != null && {
-        cache_write: cacheWriteCost * USD_PER_TOKEN_TO_PER_MILLION,
-      }),
-    }
-
-    const contextOver200k = {
-      input: priceAtContextThreshold(model, 'input_cost_per_token', 200),
-      output: priceAtContextThreshold(model, 'output_cost_per_token', 200),
-      cache_read: priceAtContextThreshold(model, 'cache_read_input_token_cost', 200),
-      cache_write: priceAtContextThreshold(model, 'cache_creation_input_token_cost', 200),
-    }
-    if (contextOver200k.input != null || contextOver200k.output != null) {
-      Object.assign(entry.cost as Record<string, unknown>, {
-        context_over_200k: {
-          input: (contextOver200k.input ?? 0) * USD_PER_TOKEN_TO_PER_MILLION,
-          output: (contextOver200k.output ?? 0) * USD_PER_TOKEN_TO_PER_MILLION,
-          ...(contextOver200k.cache_read != null && {
-            cache_read: contextOver200k.cache_read * USD_PER_TOKEN_TO_PER_MILLION,
-          }),
-          ...(contextOver200k.cache_write != null && {
-            cache_write: contextOver200k.cache_write * USD_PER_TOKEN_TO_PER_MILLION,
-          }),
-        },
-      })
-    }
-  }
+  const cost = modelCost(model)
+  if (cost) entry.cost = cost
   const input: Array<'text' | 'image' | 'pdf' | 'audio'> = ['text']
   if (model.supports_vision) input.push('image')
   if (model.supports_pdf_input) input.push('pdf')
   if (model.supports_audio_input) input.push('audio')
-  if (input.length > 1) {
-    entry.modalities = { input, output: ['text'] }
-  }
-  // Surface reasoning-effort variants. Prefer the exact levels LiteLLM
-  // reports; if it reports none but the model is reasoning-capable,
-  // assume the full ladder (see DEFAULT_REASONING_EFFORTS).
-  const reportedEfforts = info?.supports_reasoning_efforts
-  const isReasoningCapable =
-    model.supports_reasoning === true || requiresResponsesAPI(model)
-  const efforts = reportedEfforts?.length
-    ? reportedEfforts
-    : isReasoningCapable
-      ? [...DEFAULT_REASONING_EFFORTS]
-      : undefined
+  // LiteLLM often omits capability flags for database-defined models.
+  // Do not omit `modalities` in that case: OpenCode's fallback for an
+  // unknown custom model includes image input, which makes text-only
+  // llama.cpp routes receive image parts and fail with "image input is
+  // not supported". Text-only is the safe default until a proxy reports
+  // a positive capability.
+  entry.modalities = { input, output: ['text'] }
+  // Preserve the fork fallback, but prefer the proxy's exact effort levels.
+  const efforts = info?.supports_reasoning_efforts?.length
+    ? info.supports_reasoning_efforts
+    : isReasoningModel(model) ? DEFAULT_REASONING_EFFORTS : undefined
   entry.variants = efforts?.length
     ? Object.fromEntries(
-        efforts.map((effort) => [effort, { reasoningEffort: effort }]),
+        efforts.map((effort) => [
+          effort,
+          { reasoningEffort: effort },
+        ]),
       )
     : undefined
   return entry
@@ -300,17 +299,27 @@ function toConfigModel(
  *
  * Pure with respect to plugin config: it performs the network calls,
  * classifies + formats each model, and returns a `{ id -> entry }` map.
+ * The provider's `includeModels`/`excludeModels` filters,
+ * `modelCapabilities` overrides and `formatModelNames` choice are
+ * applied here (not at merge time) so every path that persists or
+ * serves a cache — cold discovery and background refresh — writes the
+ * same adjusted view.
+ *
  * Returns `null` when the proxy is unreachable/unauthorized or exposes
  * no models, so callers can distinguish "no data" from "empty result".
  */
-async function discoverModels(
+export async function discoverModels(
   baseURL: string,
   apiKey: string | undefined,
   customHeaders: Record<string, string> | undefined,
   providerId: string,
+  filters: ModelFilters = {},
+  capabilities: ModelCapabilities = {},
+  formatModelNames = true,
 ): Promise<Record<string, unknown> | null> {
   if (!(await checkLiteLLMHealth(baseURL, apiKey, customHeaders))) {
-    console.warn(
+    log(
+      'warn',
       `[opencode-litellm] LiteLLM appears offline or unauthorized for provider "${providerId}" at ${baseURL}`,
     )
     return null
@@ -327,9 +336,10 @@ async function discoverModels(
 
   if (modelsResult.status === 'rejected') {
     const error = modelsResult.reason
-    console.warn(
-      `[opencode-litellm] Model discovery failed for provider "${providerId}":`,
-      error instanceof Error ? error.message : String(error),
+    log(
+      'warn',
+      `[opencode-litellm] Model discovery failed for provider "${providerId}": ` +
+        (error instanceof Error ? error.message : String(error)),
     )
     return null
   }
@@ -340,14 +350,16 @@ async function discoverModels(
     infoByName = infoResult.value
   } else {
     const reason = infoResult.reason
-    console.warn(
-      `[opencode-litellm] /v1/model/info unavailable for provider "${providerId}"; non-chat model filtering will use id heuristics only:`,
-      reason instanceof Error ? reason.message : String(reason),
+    log(
+      'warn',
+      `[opencode-litellm] /v1/model/info unavailable for provider "${providerId}"; non-chat model filtering will use id heuristics only: ` +
+        (reason instanceof Error ? reason.message : String(reason)),
     )
   }
 
   if (discovered.length === 0) {
-    console.warn(
+    log(
+      'warn',
       `[opencode-litellm] LiteLLM responded for provider "${providerId}" but exposed zero models.`,
     )
     return null
@@ -356,17 +368,30 @@ async function discoverModels(
   const built: Record<string, unknown> = {}
   let skipped = 0
   let wildcards = 0
+  let filtered = 0
   const unmatched: string[] = []
   for (const model of discovered) {
-    // Wildcard entries (`deepseek/*`) are access rules, not
-    // callable models — invoking one sends a literal `*` upstream.
-    if (model.id.includes('*')) {
+    // `deepseek/*` is an access rule, not a callable model. But a
+    // trailing `*` (`claude-sonnet-4-6*`) is a model-group alias,
+    // so only skip the `provider/*` form.
+    if (model.id.includes('/*')) {
       wildcards++
+      continue
+    }
+    // `includeModels`/`excludeModels` let one LiteLLM proxy be split
+    // across several OpenCode providers (e.g. by upstream naming
+    // prefix) without hand-maintaining a model list.
+    if (!passesModelFilter(model.id, filters.includeModels, filters.excludeModels)) {
+      filtered++
       continue
     }
     const info = infoByName?.get(model.id)
     if (infoByName && !info) unmatched.push(model.id)
-    const entry = toConfigModel(info ? enrichModel(model, info) : model, info)
+    const entry = toConfigModel(
+      enrichModel(model, info, capabilities[model.id]),
+      info,
+      formatModelNames,
+    )
     if (!entry) {
       skipped++
       continue
@@ -375,12 +400,33 @@ async function discoverModels(
   }
 
   if (unmatched.length > 0) {
-    console.warn(
+    log(
+      'warn',
       `[opencode-litellm] /v1/model/info has no entry for ${unmatched.length} model(s) on provider "${providerId}"; ` +
         `classification uses id heuristics for: ${unmatched.slice(0, 5).join(', ')}` +
         (unmatched.length > 5 ? `, +${unmatched.length - 5} more` : ''),
     )
   }
+
+  // Only blame the filters when every non-wildcard model was rejected by
+  // them — if some hit `skipped` (non-chat) instead, `built` being empty
+  // has an unrelated cause and this warning would misdirect the user.
+  if (filtered > 0 && filtered + wildcards === discovered.length) {
+    log(
+      'warn',
+      `[opencode-litellm] includeModels/excludeModels filtered out all ${filtered} model(s) discovered for provider "${providerId}" — check the glob patterns in options.includeModels/options.excludeModels.`,
+    )
+  }
+
+  log(
+    'info',
+    `[opencode-litellm] Discovered ${discovered.length} models for provider "${providerId}" from ${baseURL} ` +
+      `(${Object.keys(built).length} built` +
+      (skipped > 0 ? `, ${skipped} non-chat hidden` : '') +
+      (wildcards > 0 ? `, ${wildcards} wildcard ignored` : '') +
+      (filtered > 0 ? `, ${filtered} filtered by includeModels/excludeModels` : '') +
+      ')',
+  )
 
   return built
 }
@@ -408,34 +454,46 @@ function mergeModels(
 }
 
 /**
- * Revalidate a baseURL's model cache off the critical path (SWR). The
+ * Revalidate a provider's model cache off the critical path (SWR). The
  * refreshed entries land in the on-disk cache and surface on the next
  * OpenCode start — OpenCode only reads provider config at startup, so
  * we can't mutate the live picker here.
  */
-async function backgroundRefresh(baseURL: string): Promise<void> {
-  if (refreshInFlight.has(baseURL)) return
-  const ctx = refreshContexts.get(baseURL)
+async function backgroundRefresh(cacheKey: string): Promise<void> {
+  if (refreshInFlight.has(cacheKey)) return
+  const ctx = refreshContexts.get(cacheKey)
   if (!ctx) return
   // Skip if the cache was refreshed recently — a burst of new sessions
   // shouldn't hammer the proxy with health checks and discovery calls.
-  const savedAt = readModelCacheSavedAt(baseURL)
+  const savedAt = readModelCacheSavedAt(cacheKey)
   if (savedAt !== null && Date.now() - savedAt < REFRESH_MIN_INTERVAL_MS) {
     return
   }
-  refreshInFlight.add(baseURL)
+  refreshInFlight.add(cacheKey)
   try {
     const built = await withTimeout(
-      discoverModels(baseURL, ctx.apiKey, ctx.customHeaders, ctx.providerId),
+      discoverModels(
+        ctx.baseURL,
+        ctx.apiKey,
+        ctx.customHeaders,
+        ctx.providerId,
+        ctx.filters,
+        ctx.capabilities,
+        ctx.formatModelNames,
+      ),
       DISCOVERY_TIMEOUT_MS,
     )
     if (built && Object.keys(built).length > 0) {
-      writeModelCache(baseURL, built)
+      writeModelCache(cacheKey, built)
+      log(
+        'info',
+        `[opencode-litellm] Background-refreshed model cache for ${ctx.baseURL} (${Object.keys(built).length} models)`,
+      )
     }
   } catch {
     // Best-effort — a failed refresh just leaves the stale cache in place.
   } finally {
-    refreshInFlight.delete(baseURL)
+    refreshInFlight.delete(cacheKey)
   }
 }
 
@@ -463,7 +521,8 @@ async function backgroundRefresh(baseURL: string): Promise<void> {
  *   }
  * }
  */
-export const LiteLLMPlugin: Plugin = async (_input: PluginInput) => {
+export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
+  initLogging(input.client)
   return {
     config: async (config: any) => {
       // Ensure the provider entry exists
@@ -509,23 +568,34 @@ export const LiteLLMPlugin: Plugin = async (_input: PluginInput) => {
             ? options.apiKey
             : undefined
         const envKey =
-          process.env.LITELLM_API_KEY ?? process.env.LITELLM_MASTER_KEY
-        const apiKey = configuredKey ?? envKey
+          process.env.LITELLM_API_KEY || process.env.LITELLM_MASTER_KEY || undefined
+        /*
+        Falls back to the key OpenCode itself stored for this provider id via
+        '/connect' (~/.local/share/opencode/auth.json). For a custom provider
+        like this one there is no automatic auth.json injection (see below), so
+        the plugin reads the stored key here and applies it to both its own
+        discovery fetches and the completion-time provider options. Without it,
+        a key-only proxy would fail discovery even though chat works.
+        */
+        const storedKey = await getOpenCodeStoredApiKey(providerId)
+        const apiKey = configuredKey ?? envKey ?? storedKey
         const customHeaders = readCustomHeaders(options)
+        const filters = readModelFilters(options)
+        const capabilities = parseModelCapabilities(options.modelCapabilities)
+        const formatModelNames = readFormatModelNames(options)
 
-        // Resolve base URL. When the provider doesn't configure one,
-        // default to Contentful's AI gateway instead of probing
-        // localhost — the gateway is the expected upstream here.
+        // Resolve base URL
         let baseURL: string | null = null
         if (configuredBase) {
           baseURL = normalizeBaseURL(configuredBase)
         } else {
-          baseURL = normalizeBaseURL(DEFAULT_BASE_URL)
+          baseURL = await autoDetectLiteLLM(apiKey, customHeaders)
         }
 
         if (!baseURL) {
-          console.warn(
-            `[opencode-litellm] No LiteLLM proxy URL resolved for provider "${providerId}". Configure options.baseURL.`,
+          log(
+            'warn',
+            `[opencode-litellm] No LiteLLM proxy found for provider "${providerId}". Configure options.baseURL or start LiteLLM on port 4000/8000/8080.`,
           )
           continue
         }
@@ -541,12 +611,25 @@ export const LiteLLMPlugin: Plugin = async (_input: PluginInput) => {
         }
 
         if (!actualProvider.options) {
-          actualProvider.options = { baseURL: `${baseURL}/v1` }
-        } else {
-          const actualOptions = actualProvider.options as Record<string, unknown>
-          if (!actualOptions.baseURL) {
-            actualOptions.baseURL = `${baseURL}/v1`
-          }
+          actualProvider.options = {}
+        }
+        const actualOptions = actualProvider.options as Record<string, unknown>
+        if (!actualOptions.baseURL) {
+          actualOptions.baseURL = `${baseURL}/v1`
+        }
+        /*
+        For a fully custom, config-only provider like this one, OpenCode
+        builds the real completion-time AI SDK client straight from
+        `options` - there's no separate auth.json auto-injection for
+        arbitrary custom providers (that only applies to a handful of
+        models.dev-catalog providers with special-cased loaders). So the
+        `apiKey` resolved above (config > env var > OpenCode-stored
+        credential) must be written back here, or real chat completions
+        go out with no Authorization header even though discovery
+        succeeded using the same resolved key.
+        */
+        if (!actualOptions.apiKey && apiKey) {
+          actualOptions.apiKey = apiKey
         }
 
         if (!actualProvider.models) {
@@ -555,13 +638,28 @@ export const LiteLLMPlugin: Plugin = async (_input: PluginInput) => {
 
         const models = actualProvider.models as Record<string, unknown>
 
+        // Identity includes the filter/capability/naming config: those
+        // are baked into cached entries, so changing them must start a
+        // fresh discovery instead of serving the old adjusted view.
+        const cacheKey = buildCacheKey(providerId, baseURL, filters, capabilities, {
+          formatModelNames,
+        })
+
         // Remember how to reach this proxy so the `event` hook can
         // revalidate its cache in the background on new sessions.
-        refreshContexts.set(baseURL, { apiKey, customHeaders, providerId })
+        refreshContexts.set(cacheKey, {
+          baseURL,
+          apiKey,
+          customHeaders,
+          filters,
+          capabilities,
+          formatModelNames,
+          providerId,
+        })
 
         // Repeat config-hook invocations within a run are a no-op once
-        // we've injected this baseURL's models.
-        const alreadyInjected = injectedModelIds.get(baseURL)
+        // we've injected this provider's models.
+        const alreadyInjected = injectedModelIds.get(cacheKey)
         if (
           alreadyInjected &&
           [...alreadyInjected].every((id) => Object.hasOwn(models, id))
@@ -572,10 +670,16 @@ export const LiteLLMPlugin: Plugin = async (_input: PluginInput) => {
         // SWR fast path: serve cached entries synchronously so startup
         // isn't blocked on the network. A background refresh (see the
         // `event` hook) keeps the cache fresh for the next launch.
-        const cached = readModelCache(baseURL)
+        // The cache is scoped per provider so two providers pointing at
+        // the same proxy (with different keys) don't share model lists.
+        const cached = readModelCache(cacheKey)
         if (cached && Object.keys(cached).length > 0) {
           const added = mergeModels(models, cached)
-          injectedModelIds.set(baseURL, new Set(added))
+          injectedModelIds.set(cacheKey, new Set(added))
+          log(
+            'info',
+            `[opencode-litellm] Loaded ${Object.keys(cached).length} models from cache for provider "${providerId}" (${baseURL}); refresh happens in the background on new sessions.`,
+          )
           continue
         }
 
@@ -583,13 +687,21 @@ export const LiteLLMPlugin: Plugin = async (_input: PluginInput) => {
         // persist for subsequent startups. Capped by a timeout so a slow
         // proxy never blocks boot.
         const built = await withTimeout(
-          discoverModels(baseURL, apiKey, customHeaders, providerId),
+          discoverModels(
+            baseURL,
+            apiKey,
+            customHeaders,
+            providerId,
+            filters,
+            capabilities,
+            formatModelNames,
+          ),
           DISCOVERY_TIMEOUT_MS,
         )
         if (built && Object.keys(built).length > 0) {
           const added = mergeModels(models, built)
-          injectedModelIds.set(baseURL, new Set(added))
-          writeModelCache(baseURL, built)
+          injectedModelIds.set(cacheKey, new Set(added))
+          writeModelCache(cacheKey, built)
         }
       }
     },
@@ -598,8 +710,8 @@ export const LiteLLMPlugin: Plugin = async (_input: PluginInput) => {
       // opens. Fresh data lands in the cache and surfaces on the next
       // OpenCode start (SWR).
       if (event.type !== 'session.created') return
-      for (const baseURL of refreshContexts.keys()) {
-        void backgroundRefresh(baseURL)
+      for (const cacheKey of refreshContexts.keys()) {
+        void backgroundRefresh(cacheKey)
       }
     },
   }

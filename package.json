@@ -1,18 +1,22 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-plugin-litellm",
-  "version": "0.8.0",
-  "description": "OpenCode plugin for LiteLLM proxy support with auto-detection and dynamic model discovery",
+  "version": "1.4.1",
+  "description": "OpenCode CLI (v1 and v2) and Desktop plugin for LiteLLM proxy support with auto-detection and dynamic model discovery",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./server": "./server.ts"
   },
   "files": [
-    "src"
+    "src",
+    "server.ts",
+    "FORK.md"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
     "build": "npm run typecheck",
     "prepublishOnly": "npm run build"
   },
@@ -40,13 +44,14 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.14.0",
-    "@opencode-ai/sdk": "^1.2.0"
+    "@opencode/plugin": "^2.0.14"
   },
   "devDependencies": {
     "@semantic-release/changelog": "^7.0.0",
     "@semantic-release/git": "^11.0.1",
     "@types/node": "^25.0.3",
     "semantic-release": "^25.0.8",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
   }
 }
